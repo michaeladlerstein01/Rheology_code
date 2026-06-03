@@ -1,0 +1,10 @@
+bin/
+lib/
+include/
+share/
+__pycache__/
+*.pyc
+.DS_Store
+*.gif
+results/
+linear_results/
