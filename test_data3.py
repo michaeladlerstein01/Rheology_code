@@ -8,6 +8,8 @@ from matplotlib import pyplot as plt
 from pathlib import Path
 
 
+seed = 42
+torch.manual_seed(seed)
 # Piecewise-linear target curve points.
 # x is normalized angle (0.25 = 90 degrees), y is normalized torque level.
 TARGET_POINTS_NORM = [
@@ -84,12 +86,13 @@ def build_disk_geometry(grid_size: int, outer_radius_m: float, device: torch.dev
     yy, xx = torch.meshgrid(coord, coord, indexing="ij")
     r_px = torch.sqrt(xx**2 + yy**2)
     disk_mask = (r_px <= radius_px).float()
-
     px_to_m = outer_radius_m / float(radius_px)
+    # Actual spacing between adjacent samples in the coordinate grid.
+    coord_step_px = (2.0 * float(radius_px)) / float(grid_size - 1)
     r_m = r_px * px_to_m
-    dA_m2 = px_to_m**2
-    return disk_mask, r_m, dA_m2
+    dA_m2 = (coord_step_px * px_to_m) ** 2
 
+    return disk_mask, r_m, dA_m2
 
 def disk_friction_torque_at_angle(
     pattern_A: torch.Tensor,
@@ -329,6 +332,98 @@ def export_plate_pattern_to_dxf(
     print(f"DXF exported: {out_dxf_path} | diameter={2.0 * plate_radius_mm:.1f} mm")
 
 
+def save_final_optimization_outputs(
+    out_dir: Path,
+    pattern_A: torch.Tensor,
+    pattern_B: torch.Tensor,
+    disk_mask: torch.Tensor,
+    angles_deg: torch.Tensor,
+    target_torque: torch.Tensor,
+    optimized_torque: torch.Tensor,
+    loss_history: list[float],
+    torque_min: float,
+    torque_max: float,
+    pressure_pa: float,
+    mu_tpu_tpu: float,
+    mu_pla_pla: float,
+    mu_tpu_pla: float,
+) -> None:
+    """
+    Save the exact final optimization result for later comparison with Abaqus.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    plate_A_np = pattern_A.detach().cpu().numpy()
+    plate_B_np = pattern_B.detach().cpu().numpy()
+    disk_np = disk_mask.detach().cpu().numpy()
+    plate_A_binary = ((plate_A_np >= 0.5) & (disk_np > 0.5)).astype(np.float32)
+    plate_B_binary = ((plate_B_np >= 0.5) & (disk_np > 0.5)).astype(np.float32)
+    angle_np = angles_deg.detach().cpu().numpy()
+    target_np = target_torque.detach().cpu().numpy()
+    optimized_np = optimized_torque.detach().cpu().numpy()
+    torque_span = torque_max - torque_min
+
+    plt.imsave(out_dir / "plate_A_soft.png", plate_A_np, cmap="gray", origin="lower", vmin=0.0, vmax=1.0)
+    plt.imsave(out_dir / "plate_B_soft.png", plate_B_np, cmap="gray", origin="lower", vmin=0.0, vmax=1.0)
+    plt.imsave(out_dir / "plate_A_binary.png", plate_A_binary, cmap="gray", origin="lower", vmin=0.0, vmax=1.0)
+    plt.imsave(out_dir / "plate_B_binary.png", plate_B_binary, cmap="gray", origin="lower", vmin=0.0, vmax=1.0)
+
+    np.savetxt(
+        out_dir / "optimized_torque_curves.csv",
+        np.column_stack(
+            [
+                angle_np,
+                target_np,
+                optimized_np,
+                (target_np - torque_min) / torque_span,
+                (optimized_np - torque_min) / torque_span,
+            ]
+        ),
+        delimiter=",",
+        header="angle_deg,target_torque_nm,optimized_torque_nm,target_torque_norm,optimized_torque_norm",
+        comments="",
+    )
+
+    np.savez(
+        out_dir / "optimized_torque_curves.npz",
+        angle_deg=angle_np,
+        target_torque_nm=target_np,
+        optimized_torque_nm=optimized_np,
+        target_torque_norm=(target_np - torque_min) / torque_span,
+        optimized_torque_norm=(optimized_np - torque_min) / torque_span,
+        plate_A_soft=plate_A_np,
+        plate_B_soft=plate_B_np,
+        plate_A_binary=plate_A_binary,
+        plate_B_binary=plate_B_binary,
+        disk_mask=disk_np,
+        loss_history=np.asarray(loss_history, dtype=float),
+        torque_min_nm=float(torque_min),
+        torque_max_nm=float(torque_max),
+        pressure_pa=float(pressure_pa),
+        mu_tpu_tpu=float(mu_tpu_tpu),
+        mu_pla_pla=float(mu_pla_pla),
+        mu_tpu_pla=float(mu_tpu_pla),
+        plate_diameter_mm=float(PLATE_DIAMETER_MM),
+        seed=int(seed),
+    )
+
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    ax.plot(angle_np, target_np, linewidth=2.5, label="Target torque")
+    ax.plot(angle_np, optimized_np, "--", linewidth=2.0, label="Optimized prediction")
+    ax.set_title("Final Optimized Torque Curve")
+    ax.set_xlabel("Angle (deg)")
+    ax.set_ylabel("Torque (N.m)")
+    ax.set_xlim(0.0, 360.0)
+    ax.set_xticks(np.arange(0.0, 361.0, 45.0))
+    ax.grid(True, alpha=0.35)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "final_optimized_torque_curve.png", dpi=180)
+    plt.close(fig)
+
+    print(f"Final optimization outputs saved in: {out_dir.resolve()}")
+
+
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -339,12 +434,12 @@ if __name__ == "__main__":
     # Disk friction model constants
     outer_radius_m = OUTER_RADIUS_M  # 50 mm diameter plate
     pressure_pa = 20000.0  # uniform contact pressure
-    mu_tpu_tpu = 0.60
-    mu_pla_pla = 0.30
+    mu_tpu_tpu = 0.34
+    mu_pla_pla = 0.26
     # Keep cross-material friction away from the arithmetic mean.
     # If mu_tpu_pla == 0.5*(mu_tpu_tpu + mu_pla_pla), angle interaction cancels.
     # Lower values here increase modulation depth in angle response.
-    mu_tpu_pla = 0.30
+    mu_tpu_pla = 0.21
 
     interaction_gain = mu_tpu_tpu - 2.0 * mu_tpu_pla + mu_pla_pla
     if abs(interaction_gain) < 1e-6:
@@ -596,6 +691,39 @@ if __name__ == "__main__":
         live_fig.canvas.draw_idle()
         live_fig.canvas.flush_events()
         live_fig.show()
+
+    with torch.no_grad():
+        pattern_A = generate_pattern_torch(grid_size, M2, N2, beta, c_cos_A, c_sin_A)
+        pattern_B = generate_pattern_torch(grid_size, M2, N2, beta, c_cos_B, c_sin_B)
+        torque_pred = disk_friction_sweep_torch(
+            pattern_A=pattern_A,
+            pattern_B=pattern_B,
+            angles_deg=angles_deg,
+            disk_mask=disk_mask,
+            radius_map_m=radius_map_m,
+            pixel_area_m2=pixel_area_m2,
+            pressure_pa=pressure_pa,
+            mu_tpu_tpu=mu_tpu_tpu,
+            mu_pla_pla=mu_pla_pla,
+            mu_tpu_pla=mu_tpu_pla,
+        )
+
+    save_final_optimization_outputs(
+        out_dir=Path("results") / "test3_final",
+        pattern_A=pattern_A,
+        pattern_B=pattern_B,
+        disk_mask=disk_mask,
+        angles_deg=angles_deg,
+        target_torque=target_torque,
+        optimized_torque=torque_pred,
+        loss_history=loss_history,
+        torque_min=torque_min,
+        torque_max=torque_max,
+        pressure_pa=pressure_pa,
+        mu_tpu_tpu=mu_tpu_tpu,
+        mu_pla_pla=mu_pla_pla,
+        mu_tpu_pla=mu_tpu_pla,
+    )
 
     # Export final optimized patterns as DXF files for CAD/Fusion workflows.
     export_plate_pattern_to_dxf(
